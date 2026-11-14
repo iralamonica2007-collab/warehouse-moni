@@ -1,10 +1,21 @@
 from sqlalchemy import Integer, String, Column, create_engine, DateTime, ForeignKey 
 from sqlalchemy.orm import Session, declarative_base 
-from datetime import datetime 
- 
-DB_PATH = "canteen-preorder.db" 
-engine = create_engine(f"sqlite:///{DB_PATH}") 
-Base = declarative_base() 
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher()
+
+DB_PATH = "canteen-preorder.db"
+engine = create_engine(f"sqlite:///{DB_PATH}")
+Base = declarative_base()
+
+ACCESS_TOKEN_EXPIRY = 15  # mins
+REFRESH_TOKEN_EXPIRY = 7 * 24 * 60  # mins
+SECRET_KEY = "SECRET123"  # shortcut: hardcoded secret, move to an env variable before deploying
+ALGORITHM = "HS256"
  
 class MenuItem(Base): 
     __tablename__ = "menu_items" 
@@ -23,8 +34,18 @@ class Order(Base):
     quantity = Column(Integer) 
     status = Column(String, default="placed") 
     ordered_at = Column(DateTime, default=datetime.now) 
-    collected_at = Column(DateTime, nullable=True) 
-Base.metadata.create_all(engine)  
+    collected_at = Column(DateTime, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    user_id = Column(Integer, primary_key=True)
+    user_name = Column(String)
+    password = Column(String)
+    role = Column(String, default="student")  # staff = kitchen staff, student = places orders
+
+
+Base.metadata.create_all(engine)
  
 def menu_items(): 
     session = Session(engine) 
@@ -113,6 +134,7 @@ def add_menu_item(name, category, price):
         return None
     item = MenuItem(name=name, category=category, price=price, available=1)
     session.add(item)
+    session.commit()  # commit first so item.id is set
     response = {
         "id": item.id,
         "name": item.name,
@@ -120,7 +142,6 @@ def add_menu_item(name, category, price):
         "price": item.price,
         "available": item.available
     }
-    session.commit()
     session.close()
     return response
 
@@ -181,3 +202,66 @@ def get_order_by_id(id):
     }
     session.close()
     return response
+
+# ---- Authentication ----
+
+def verify_login(username, password):
+    session = Session(engine)
+    user = session.query(User).filter_by(user_name=username).first()
+    session.close()
+    if user is None:
+        return False
+    try:
+        ph.verify(user.password, password)
+    except VerifyMismatchError:
+        return False
+    return {
+        "access_token": create_token(username=username, token_type="access"),
+        "refresh_token": create_token(username=username, token_type="refresh"),
+        "username": user.user_name,
+        "role": user.role
+    }
+
+
+def create_token(username, token_type):
+    time = ACCESS_TOKEN_EXPIRY
+    if token_type == "refresh":
+        time = REFRESH_TOKEN_EXPIRY
+    payload = {
+        "username": username,
+        "token_type": token_type,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=time)
+    }
+    return jwt.encode(payload, key=SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_token(token, token_type):
+    try:
+        payload = jwt.decode(jwt=token, key=SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        return False
+    if payload["token_type"] == token_type:
+        return payload["username"]
+    return False
+
+
+# ---- Users ----
+
+def register_user(user_name, password, role):
+    session = Session(engine)
+    if session.query(User).filter_by(user_name=user_name).first() is not None:
+        session.close()
+        return False
+    session.add(User(user_name=user_name, password=ph.hash(password), role=role.strip().lower()))
+    session.commit()
+    session.close()
+    return True
+
+
+def get_user_role(username):
+    session = Session(engine)
+    user = session.query(User).filter_by(user_name=username).first()
+    session.close()
+    if user is None or user.role is None:
+        return None
+    return user.role.strip().lower()
