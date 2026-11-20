@@ -1,5 +1,0 @@
-argon2-cffi
-fastapi
-sqlalchemy
-pyjwt
-uvicorn
